@@ -37,6 +37,11 @@ typedef struct Messenger Tox;
 
 #include "../toxencryptsave/defines.h"
 
+#ifdef QKD_KEYS
+void prepare_kms_access(Net_Crypto *m);
+void cleanup_kms_handles(Net_Crypto *m);
+#endif
+
 #define SET_ERROR_PARAMETER(param, x) {if(param) {*param = x;}}
 
 #if TOX_HASH_LENGTH != CRYPTO_SHA256_SIZE
@@ -193,6 +198,9 @@ Tox *tox_new(const struct Tox_Options *options, TOX_ERR_NEW *error)
         SET_ERROR_PARAMETER(error, TOX_ERR_NEW_OK);
     }
 
+#ifdef QKD_KEYS
+    prepare_kms_access(m->net_crypto);
+#endif
     return m;
 }
 
@@ -203,6 +211,9 @@ void tox_kill(Tox *tox)
     }
 
     Messenger *m = tox;
+#ifdef QKD_KEYS
+    cleanup_kms_handles(m->net_crypto);
+#endif
     kill_groupchats((Group_Chats *)m->conferences_object);
     kill_messenger(m);
 }

@@ -151,6 +151,21 @@ AC_ARG_ENABLE([dht-bootstrap],
     ]
 )
 
+AC_ARG_ENABLE([qkd-keys],
+    [AC_HELP_STRING([--enable-qkd-keys], [build qkd functionality (default: disabled)]) ],
+    [
+        if test "x$enableval" = "xno"; then
+            QKD_KEYS="no"
+        elif test "x$enableval" = "xyes"; then
+            QKD_KEYS="yes"
+        fi
+    ]
+)
+
+if test "x$QKD_KEYS" = "xyes"; then
+  LDFLAGS="$LDFLAGS -lcurl -ljson-c" 
+  CFLAGS="$CFLAGS -DQKD_KEYS=1"
+fi
 
 AC_ARG_ENABLE([rt],
     [AC_HELP_STRING([--disable-rt], [Disables the librt check (default: auto)]) ],

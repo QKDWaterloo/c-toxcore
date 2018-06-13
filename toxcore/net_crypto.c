@@ -32,6 +32,12 @@
 #include "util.h"
 
 #include <math.h>
+#ifdef QKD_KEYS
+#include <stdlib.h>
+#include <curl/curl.h>
+#include <json-c/json.h>
+#include <ctype.h> 
+#endif
 
 typedef struct {
     uint64_t sent_time;
@@ -151,8 +157,267 @@ struct Net_Crypto {
     /* The current optimal sleep time */
     uint32_t current_sleep_time;
 
+#ifdef QKD_KEYS
+    //All the char arrays are NULL terminated strings
+    char getkey_url[128];
+    char newkey_url[128];
+    char uaa_url[128];
+    char site_id[4];
+    char block_id[37];
+    unsigned char key[32]; //shared key from KMS
+    char peer_site_id[4];
+    int index;
+    CURL *curl_handle;
+#endif 
+
     BS_LIST ip_port_list;
 };
+
+#ifdef QKD_KEYS
+
+void prepare_kms_access(Net_Crypto *m) {
+  char *str = "/.kmsqtox/kms.conf";
+  FILE *fp;
+  char buffer[128];
+  
+  const char *homedir;
+  homedir = getenv("HOME");
+  char filestr[256];
+  strcpy(filestr, homedir);
+  strcpy(filestr+strlen(homedir), str);
+  filestr[strlen(homedir) + strlen(str)] = '\0';
+
+  fp = fopen(filestr, "r");
+
+  fgets(buffer, sizeof buffer, fp);
+  buffer[strlen(buffer) - 1] = '\0';
+  strcpy(m->uaa_url, buffer);
+  m->uaa_url[strlen(buffer)] = '\0';  
+  
+  fgets(buffer, sizeof buffer, fp);
+  buffer[strlen(buffer) - 1] = '\0';
+  strcpy(m->newkey_url, buffer);
+  m->newkey_url[strlen(buffer)] = '\0';  
+  
+  fgets(buffer, sizeof buffer, fp);
+  buffer[strlen(buffer) - 1] = '\0';
+  strcpy(m->getkey_url, buffer);
+  m->getkey_url[strlen(buffer)] = '\0';  
+
+  fgets(buffer, sizeof buffer, fp);
+  buffer[strlen(buffer) - 1] = '\0';
+  strcpy(m->site_id, buffer);
+  m->site_id[strlen(buffer)] = '\0';
+  fclose(fp); 
+
+  curl_global_init(CURL_GLOBAL_ALL);
+  m->curl_handle = curl_easy_init();
+
+}
+
+void  cleanup_kms_handles(Net_Crypto *c) {
+  curl_easy_cleanup(c->curl_handle);
+  curl_global_cleanup();
+}
+
+
+static const char *token_header = "authorization:Basic aHRtbDU6cGFzc3dvcmQ=";
+static const char *token_post = "password=bot&client_secret=password&client=html5&username=pwebb&grant_type=password&scope=openid";
+static const char *key_header = "Authorization: Bearer ";
+static const char *query_str = "siteid=";
+
+struct MemoryStruct {
+    char *memory;
+    int size;
+};
+
+static inline int cval(char c){
+    if (c>='a') return c-'a'+0x0a;
+    if (c>='A') return c-'A'+0x0a;
+    return c-'0';
+}
+
+int hex2bin(char *str, unsigned char *out){
+    int i;
+    int len = strlen(str);
+    for(i = 0; i < len; i+=2) {
+        if (!isxdigit(str[i])&& !isxdigit(str[i+1]))
+            return -1;
+        out[i/2] = (cval(str[i])<<4) + cval(str[i+1]);
+    }
+    return i/2;
+}
+
+static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp){
+  size_t realsize = size * nmemb;
+    struct MemoryStruct *mem = (struct MemoryStruct *)userp;
+
+    mem->memory = realloc(mem->memory, mem->size + realsize + 1);
+    if(mem->memory == NULL) {
+        /* out of memory! */
+        printf("not enough memory (realloc returned NULL)\n");
+        return 0;
+    }
+
+    memcpy(&(mem->memory[mem->size]), contents, realsize);
+    mem->size += realsize;
+    mem->memory[mem->size] = 0;
+
+    return realsize;
+}
+
+static CURLcode fetch(Net_Crypto *nc, struct MemoryStruct *chunk, const char *url,
+                      const char *header, const char *post) {
+    CURLcode res;
+    struct curl_slist *list = NULL;
+    CURL *handle;
+    handle = nc->curl_handle;
+    curl_easy_setopt(handle, CURLOPT_POST, 1L);
+    curl_easy_setopt(handle, CURLOPT_URL, url);
+    list = curl_slist_append(NULL, header);
+    curl_easy_setopt(handle, CURLOPT_POSTFIELDS, post);
+    curl_easy_setopt(handle, CURLOPT_HTTPHEADER, list);
+    curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
+    curl_easy_setopt(handle, CURLOPT_VERBOSE, 0L);
+    curl_easy_setopt(handle, CURLOPT_WRITEDATA, (void *)chunk);
+    curl_easy_setopt(handle, CURLOPT_NOPROGRESS, 1L);
+    res = curl_easy_perform(handle);
+    curl_slist_free_all(list);
+    return res;
+}
+
+int get_key(struct Net_Crypto *nc, char *token, int is_new) {
+
+    CURLcode res;
+    struct MemoryStruct chunk;
+    int err = 0;
+    CURL *handle;
+
+    handle = nc->curl_handle;
+    chunk.memory = malloc(1);
+    chunk.size = 0;
+    char hex[65];
+
+    int len = strlen(key_header) + strlen(token) + 1;
+    char *buf = (char*)malloc(len);
+    strcpy(buf, key_header);
+    strcpy(buf+strlen(key_header), token);
+    buf[len] = '\0';
+    if (is_new) {
+         int len_post = strlen(nc->peer_site_id) + strlen(query_str);
+         char *post = (char*)malloc(len_post+1);
+
+        strcpy(post, query_str);
+        strcpy(post + strlen(query_str), nc->peer_site_id);
+        post[len_post] = '\0';
+        printf("key_post : %s\n", post);
+        res = fetch(nc, &chunk, nc->newkey_url, buf, post);
+
+    } else {
+        char dex [sizeof(long)*8+1];
+        snprintf (dex, sizeof(dex), "%ld", nc->index);
+        int len_post =  strlen(query_str) + strlen(nc->peer_site_id) + strlen("&index=") + strlen(dex) + strlen("&blockid=") + strlen(nc->block_id);
+        char *post = (char*)malloc(len_post+1);
+        strcpy(post, query_str);
+        strcpy(post + strlen(query_str), nc->peer_site_id);
+        strcpy(post + strlen(query_str) + strlen(nc->peer_site_id), "&index=");
+        strcpy(post + strlen(query_str) + strlen(nc->peer_site_id) + strlen("&index="), dex);
+        strcpy(post + strlen(query_str) + strlen(nc->peer_site_id) + strlen("&index=") + strlen(dex), "&blockid=");
+        strcpy(post + strlen(query_str) + strlen(nc->peer_site_id) + strlen("&index=") + strlen(dex) + strlen("&blockid="), nc->block_id);
+        post[len_post] = '\0';
+
+        printf("post String %s\n", post);
+
+        res = fetch(nc, &chunk, nc->getkey_url, buf, post);
+        free(post);
+    }
+
+    if(res != CURLE_OK) {
+        fprintf(stderr, "curl_easy_perform() failed: %s\n",
+                curl_easy_strerror(res));
+    } else {
+        json_object *keyobj = json_tokener_parse(chunk.memory);
+        printf("%*.*s\n", 0, chunk.size, (unsigned char *)chunk.memory);
+
+        json_object_object_foreach(keyobj, key1, val1) {
+
+            if (strcmp("error", key1) == 0 ) {
+                err = 1;
+                break;
+            } else {
+                if(strcmp("index", key1) == 0 ) {
+                    char *ptr;
+                    nc->index = strtol((char *)json_object_get_string(val1), &ptr, 10);
+                    printf("index: %ld\n", nc->index);
+                } else if(strcmp("hexKey", key1) == 0 ) {
+                    memcpy(hex, (char *)json_object_get_string(val1), 64);
+                    hex[64] = '\0';
+                    printf("key: %s \n", hex);
+                    hex2bin((char*)hex, (unsigned char*)nc->key);
+                } else if(strcmp("blockId", key1) == 0 ) {
+                    strcpy(nc->block_id, (char *)json_object_get_string(val1));
+                    printf("blockId: %.*s \n", 36, nc->block_id);
+                }
+            }
+        }
+        json_object_put(keyobj);
+    }
+    free(buf);
+    return err;
+}
+
+int get_token(struct Net_Crypto *nc, char** token) {
+
+    CURLcode res;
+    struct MemoryStruct chunk;
+    int err = 0;
+    CURL *handle;
+
+    handle = nc->curl_handle;
+    chunk.memory = malloc(1);
+    chunk.size = 0;
+    res = fetch(nc, &chunk, nc->uaa_url, token_header, token_post);
+
+    if(res != CURLE_OK) {
+        fprintf(stderr, "curl_easy_perform() failed: %s\n",
+                curl_easy_strerror(res));
+        err = 1;
+    } else {
+        json_object *jobj = json_tokener_parse(chunk.memory);
+        json_object_object_foreach(jobj, key, val) {
+            if (strcmp("error", key) == 0 ) {
+                err =1;
+                printf("key: %s, type of val: %s\n", key, (char *)json_object_get_string(val));
+                break;
+            } else if (strcmp("access_token", key) == 0 ) {
+                int len = strlen((char *)json_object_get_string(val));
+                *token = (char*)malloc(len+1);
+                strcpy(*token, (char *)json_object_get_string(val));
+                (*token)[len] = '\0';
+            }
+        }
+        json_object_put(jobj);
+    }
+
+    free(chunk.memory);
+    return err;
+}
+
+void fetch_new_qkd_key(struct Net_Crypto *nc) {
+  char *token;
+  get_token(nc, &token);
+  get_key(nc, token, 1);
+  free(token); 
+
+}
+
+void fetch_qkd_key(struct Net_Crypto *nc) {
+  char *token;
+  get_token(nc, &token);
+  get_key(nc, token, 0);
+  free(token); 
+}
+#endif
 
 const uint8_t *nc_get_self_public_key(const Net_Crypto *c)
 {
@@ -446,7 +711,17 @@ static int handle_cookie_response(uint8_t *cookie, uint64_t *number, const uint8
     return COOKIE_LENGTH;
 }
 
+#ifdef QKD_KEYS
+#define QKD_KEY_SIZE 32
+#define QKD_KEY_INDEX_SIZE 4
+#define QKD_SITE_ID_SIZE 4
+#define QKD_BLOCK_ID_SIZE 36
+#define QKD_PKT_DATA (QKD_KEY_INDEX_SIZE + QKD_SITE_ID_SIZE + QKD_BLOCK_ID_SIZE)
+#define HANDSHAKE_PACKET_LENGTH (1 + COOKIE_LENGTH + CRYPTO_NONCE_SIZE + CRYPTO_NONCE_SIZE + CRYPTO_PUBLIC_KEY_SIZE + CRYPTO_SHA512_SIZE + COOKIE_LENGTH + CRYPTO_MAC_SIZE + QKD_PKT_DATA)
+#else
 #define HANDSHAKE_PACKET_LENGTH (1 + COOKIE_LENGTH + CRYPTO_NONCE_SIZE + CRYPTO_NONCE_SIZE + CRYPTO_PUBLIC_KEY_SIZE + CRYPTO_SHA512_SIZE + COOKIE_LENGTH + CRYPTO_MAC_SIZE)
+#endif
+
 
 /* Create a handshake packet and put it in packet.
  * cookie must be COOKIE_LENGTH bytes.
@@ -471,6 +746,26 @@ static int create_crypto_handshake(const Net_Crypto *c, uint8_t *packet, const u
         return -1;
     }
 
+#ifdef QKD_KEYS
+    random_nonce(packet + 1 + QKD_PKT_DATA + COOKIE_LENGTH);
+    int len = encrypt_data(peer_real_pk, c->self_secret_key, packet + 1 + QKD_PKT_DATA + COOKIE_LENGTH, plain, sizeof(plain),
+                           packet + 1 + QKD_PKT_DATA + COOKIE_LENGTH + CRYPTO_NONCE_SIZE);
+
+    if (len != HANDSHAKE_PACKET_LENGTH - (1 + QKD_PKT_DATA + COOKIE_LENGTH + COOKIE_LENGTH + CRYPTO_NONCE_SIZE)) {
+        return -1;
+    }
+
+    packet[0] = NET_PACKET_CRYPTO_HS;
+    memcpy(packet + 1 + QKD_PKT_DATA, cookie, COOKIE_LENGTH);
+    
+    packet[4] = c->index & 0xff;
+    packet[3] = (c->index >> 8) & 0xff;
+    packet[2] = (c->index >> 16) & 0xff;
+    packet[1] = (c->index >> 24) & 0xff;
+
+    memcpy(packet + 1 + QKD_KEY_INDEX_SIZE, c->site_id, QKD_SITE_ID_SIZE);
+    memcpy(packet + 1 + QKD_KEY_INDEX_SIZE + QKD_SITE_ID_SIZE, c->block_id, QKD_BLOCK_ID_SIZE);
+#else
     random_nonce(packet + 1 + COOKIE_LENGTH);
     int len = encrypt_data(peer_real_pk, c->self_secret_key, packet + 1 + COOKIE_LENGTH, plain, sizeof(plain),
                            packet + 1 + COOKIE_LENGTH + CRYPTO_NONCE_SIZE);
@@ -481,6 +776,7 @@ static int create_crypto_handshake(const Net_Crypto *c, uint8_t *packet, const u
 
     packet[0] = NET_PACKET_CRYPTO_HS;
     memcpy(packet + 1, cookie, COOKIE_LENGTH);
+#endif
 
     return HANDSHAKE_PACKET_LENGTH;
 }
@@ -503,7 +799,7 @@ static int create_crypto_handshake(const Net_Crypto *c, uint8_t *packet, const u
  * return -1 on failure.
  * return 0 on success.
  */
-static int handle_crypto_handshake(const Net_Crypto *c, uint8_t *nonce, uint8_t *session_pk, uint8_t *peer_real_pk,
+static int handle_crypto_handshake(Net_Crypto *c, uint8_t *nonce, uint8_t *session_pk, uint8_t *peer_real_pk,
                                    uint8_t *dht_public_key, uint8_t *cookie, const uint8_t *packet, uint16_t length, const uint8_t *expected_real_pk)
 {
     if (length != HANDSHAKE_PACKET_LENGTH) {
@@ -511,10 +807,15 @@ static int handle_crypto_handshake(const Net_Crypto *c, uint8_t *nonce, uint8_t 
     }
 
     uint8_t cookie_plain[COOKIE_DATA_LENGTH];
-
-    if (open_cookie(cookie_plain, packet + 1, c->secret_symmetric_key) != 0) {
+#if QKD_KEYS
+    if (open_cookie(cookie_plain, packet + 1 + QKD_PKT_DATA, c->secret_symmetric_key) != 0) {
         return -1;
     }
+#else
+    if (open_cookie(cookie_plain, packet + 1 , c->secret_symmetric_key) != 0) {
+        return -1;
+    }
+#endif
 
     if (expected_real_pk) {
         if (public_key_cmp(cookie_plain, expected_real_pk) != 0) {
@@ -522,6 +823,28 @@ static int handle_crypto_handshake(const Net_Crypto *c, uint8_t *nonce, uint8_t 
         }
     }
 
+#if QKD_KEYS
+    uint8_t cookie_hash[CRYPTO_SHA512_SIZE];
+    crypto_sha512(cookie_hash, packet + 1 + QKD_PKT_DATA, COOKIE_LENGTH);
+
+    uint8_t plain[CRYPTO_NONCE_SIZE + CRYPTO_PUBLIC_KEY_SIZE + CRYPTO_SHA512_SIZE + COOKIE_LENGTH];
+    int len = decrypt_data(cookie_plain, c->self_secret_key, packet + 1 + QKD_PKT_DATA +  COOKIE_LENGTH,
+                           packet + 1 + QKD_PKT_DATA + COOKIE_LENGTH + CRYPTO_NONCE_SIZE,
+                           HANDSHAKE_PACKET_LENGTH - (1 + QKD_PKT_DATA + COOKIE_LENGTH + CRYPTO_NONCE_SIZE), plain);
+
+    
+    c->index =  packet[1];
+    c->index = (c->index << 8) | packet[2];
+    c->index = (c->index << 16) | packet[3];
+    c->index = (c->index << 24) | packet[4];
+
+    memcpy(c->peer_site_id, packet + 1 + QKD_KEY_INDEX_SIZE, QKD_SITE_ID_SIZE);
+    memcpy(c->block_id, packet + 1 + QKD_KEY_INDEX_SIZE + QKD_SITE_ID_SIZE, QKD_BLOCK_ID_SIZE);
+ 
+    printf("Index recieved: %d (handle_crypto_handshake)\n", c->index);
+    printf("Site ID recieved: %s (handle_crypto_handshake)\n", c->peer_site_id);
+    printf("Block ID recieved: %*.*s (handle_crypto_handshake)\n", 0, QKD_BLOCK_ID_SIZE,c->block_id);
+#else
     uint8_t cookie_hash[CRYPTO_SHA512_SIZE];
     crypto_sha512(cookie_hash, packet + 1, COOKIE_LENGTH);
 
@@ -529,6 +852,7 @@ static int handle_crypto_handshake(const Net_Crypto *c, uint8_t *nonce, uint8_t 
     int len = decrypt_data(cookie_plain, c->self_secret_key, packet + 1 + COOKIE_LENGTH,
                            packet + 1 + COOKIE_LENGTH + CRYPTO_NONCE_SIZE,
                            HANDSHAKE_PACKET_LENGTH - (1 + COOKIE_LENGTH + CRYPTO_NONCE_SIZE), plain);
+#endif
 
     if (len != sizeof(plain)) {
         return -1;
@@ -1634,7 +1958,10 @@ static int handle_packet_connection(Net_Crypto *c, int crypt_connection_id, cons
             if (number != conn->cookie_request_number) {
                 return -1;
             }
-
+#ifdef QKD_KEYS
+            c->index = -1; 
+            memset(c->block_id, 0, 36);
+#endif
             if (create_send_handshake(c, crypt_connection_id, cookie, conn->dht_public_key) != 0) {
                 return -1;
             }
@@ -1656,8 +1983,12 @@ static int handle_packet_connection(Net_Crypto *c, int crypt_connection_id, cons
                 }
 
                 if (public_key_cmp(dht_public_key, conn->dht_public_key) == 0) {
+#ifdef QKD_KEYS
+                    fetch_qkd_key(c); 
+                    memcpy(conn->shared_key, c->key, QKD_KEY_SIZE);
+#else
                     encrypt_precompute(conn->peersessionpublic_key, conn->sessionsecret_key, conn->shared_key);
-
+#endif
                     if (conn->status == CRYPTO_CONN_COOKIE_REQUESTING) {
                         if (create_send_handshake(c, crypt_connection_id, cookie, dht_public_key) != 0) {
                             return -1;
@@ -1908,8 +2239,12 @@ static int handle_new_connection_handshake(Net_Crypto *c, IP_Port source, const 
             if (conn && (conn->status == CRYPTO_CONN_COOKIE_REQUESTING || conn->status == CRYPTO_CONN_HANDSHAKE_SENT)) {
                 memcpy(conn->recv_nonce, n_c.recv_nonce, CRYPTO_NONCE_SIZE);
                 memcpy(conn->peersessionpublic_key, n_c.peersessionpublic_key, CRYPTO_PUBLIC_KEY_SIZE);
+#ifdef QKD_KEYS
+                fetch_new_qkd_key(c);
+                 memcpy(conn->shared_key, c->key, QKD_KEY_SIZE);
+#else
                 encrypt_precompute(conn->peersessionpublic_key, conn->sessionsecret_key, conn->shared_key);
-
+#endif
                 crypto_connection_add_source(c, crypt_connection_id, source);
 
                 if (create_send_handshake(c, crypt_connection_id, n_c.cookie, n_c.dht_public_key) == 0) {
@@ -1965,7 +2300,13 @@ int accept_crypto_connection(Net_Crypto *c, New_Connection *n_c)
     memcpy(conn->peersessionpublic_key, n_c->peersessionpublic_key, CRYPTO_PUBLIC_KEY_SIZE);
     random_nonce(conn->sent_nonce);
     crypto_new_keypair(conn->sessionpublic_key, conn->sessionsecret_key);
+#ifdef QKD_KEYS
+     fetch_new_qkd_key(c);
+     memcpy(conn->shared_key, c->key, QKD_KEY_SIZE);
+#else
     encrypt_precompute(conn->peersessionpublic_key, conn->sessionsecret_key, conn->shared_key);
+#endif
+
     conn->status = CRYPTO_CONN_NOT_CONFIRMED;
 
     if (create_send_handshake(c, crypt_connection_id, n_c->cookie, n_c->dht_public_key) != 0) {
