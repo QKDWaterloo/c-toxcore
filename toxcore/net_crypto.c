@@ -751,7 +751,7 @@ static int create_crypto_handshake(const Net_Crypto *c, uint8_t *packet, const u
     int len = encrypt_data(peer_real_pk, c->self_secret_key, packet + 1 + QKD_PKT_DATA + COOKIE_LENGTH, plain, sizeof(plain),
                            packet + 1 + QKD_PKT_DATA + COOKIE_LENGTH + CRYPTO_NONCE_SIZE);
 
-    if (len != HANDSHAKE_PACKET_LENGTH - (1 + QKD_PKT_DATA + COOKIE_LENGTH + COOKIE_LENGTH + CRYPTO_NONCE_SIZE)) {
+    if (len != HANDSHAKE_PACKET_LENGTH - (1 + QKD_PKT_DATA +  COOKIE_LENGTH + CRYPTO_NONCE_SIZE)) {
         return -1;
     }
 
