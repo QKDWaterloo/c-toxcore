@@ -36,7 +36,7 @@ RUN export BUILD_PACKAGES="\
 # remove all the example bootstrap nodes from the config file
     sed -i '/^bootstrap_nodes = /,$d' /etc/tox-bootstrapd.conf && \
 # add bootstrap nodes from https://nodes.tox.chat/
-    python3 other/bootstrap_daemon/docker/get-nodes.py >> /etc/tox-bootstrapd.conf && \
+   # python3 other/bootstrap_daemon/docker/get-nodes.py >> /etc/tox-bootstrapd.conf && \
 # perform cleanup
     apt-get remove --purge -y $BUILD_PACKAGES && \
     apt-get clean && \
