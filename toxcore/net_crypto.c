@@ -176,7 +176,7 @@ struct Net_Crypto {
 #ifdef QKD_KEYS
 
 void prepare_kms_access(Net_Crypto *m) {
-  char *str = "/.kmsqtox/kms.conf";
+  char *str = "/.kms/kms.conf";
   FILE *fp;
   char buffer[128];
   
